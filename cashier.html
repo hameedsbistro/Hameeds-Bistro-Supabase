@@ -1000,7 +1000,7 @@ function formatDeviceLocalTime(value){ if(!value) return ""; const d=new Date(va
                 </div>
                 <div>
                     <label class="block text-xs font-extrabold text-gray-700 mb-1">ENTER PRICE (RM)</label>
-                    <input id="variableItemPriceInput" type="number" inputmode="decimal" min="0.01" step="0.01"
+                    <input id="variableItemPriceInput" type="text" inputmode="decimal" autocomplete="off" min="0.01" step="0.01" pattern="[0-9]*[.]?[0-9]*"
                         class="w-full border-2 border-gray-200 rounded-xl px-3 py-3 text-lg font-extrabold focus:outline-none focus:ring-2 focus:ring-emerald-500"
                         placeholder="0.00">
                     <div id="variableItemError" class="hidden text-xs font-bold text-red-600 mt-2"></div>
@@ -2716,7 +2716,8 @@ posEnteredAmountString = "";
             const error = document.getElementById('variableItemError');
 
             const customName = String(nameInput?.value || '').trim();
-            const enteredPrice = Number(priceInput?.value || 0);
+            const rawPrice = String(priceInput?.value || '').trim().replace(/,/g, '.');
+            const enteredPrice = rawPrice === '' ? NaN : Number(rawPrice);
 
             if (pendingVariablePosItem.requiresName && !customName) {
                 if (error) {
@@ -4305,30 +4306,61 @@ function closeCombineSplitModal(){const m=document.getElementById('combineSplitM
   };
 
   // ---------- COMBINE: always close popup and refresh target order ----------
+  // ---------- COMBINE: claim each source order before copying, so retries cannot duplicate rows ----------
+  let combineOrdersRunning = false;
   window.executeCombineOrders=async function(){
-    const ids=[...document.querySelectorAll('.combine-order-check:checked')].map(x=>Number(x.value)).filter(Boolean);
-    if(!ids.length)return;
+    if(combineOrdersRunning)return;
+    const ids=[...new Set([...document.querySelectorAll('.combine-order-check:checked')].map(x=>Number(x.value)).filter(Boolean))];
+    if(!ids.length){alert('Select at least one order.');return;}
     const target=Number(posTargetOrderId);
-    for(const id of ids){
-      const {data:items,error}=await _supabase.from('order_items').select('*').eq('order_id',id);
-      if(error)throw error;
-      for(const item of (items||[])){
-        const payload={order_id:target,menu_item_id:item.menu_item_id,price:item.price,quantity:item.quantity};
-        if(item.modifiers!==undefined)payload.modifiers=item.modifiers;
-        let r=await _supabase.from('order_items').insert([payload]);
-        if(r.error){delete payload.modifiers;r=await _supabase.from('order_items').insert([payload]);}
-        if(r.error)throw r.error;
+    if(!target || ids.includes(target)){alert('Invalid order selection.');return;}
+    combineOrdersRunning=true;
+    const actionButton=document.querySelector('#combineSplitBody button[onclick="executeCombineOrders()"]');
+    if(actionButton){actionButton.disabled=true;actionButton.textContent='COMBINING...';}
+    try{
+      for(const id of ids){
+        // Atomic status transition acts as a claim. A second click/device cannot claim it again.
+        const claim=await _supabase.from('orders').update({status:'Combining'})
+          .eq('id',id).in('status',['pending','accepted','Pending','Accepted','HOLD','Held','hold'])
+          .select('id').maybeSingle();
+        if(claim.error)throw claim.error;
+        if(!claim.data)continue; // Already combined/being combined: never copy twice.
+
+        const {data:items,error}=await _supabase.from('order_items').select('*').eq('order_id',id);
+        if(error)throw error;
+        const rows=(items||[]).map(item=>{
+          const row={order_id:target,menu_item_id:item.menu_item_id,price:item.price,quantity:item.quantity};
+          ['modifiers','modifier_notes','added_by_id','added_by_name','added_by_email','added_at'].forEach(k=>{if(item[k]!==undefined)row[k]=item[k]});
+          return row;
+        });
+        if(rows.length){
+          let ins=await _supabase.from('order_items').insert(rows);
+          if(ins.error && rows.some(r=>r.modifiers!==undefined)){
+            const fallback=rows.map(({modifiers,...r})=>r);
+            ins=await _supabase.from('order_items').insert(fallback);
+          }
+          if(ins.error)throw ins.error;
+        }
+        const done=await _supabase.from('orders').update({status:'Combined',payment_status:'Merged'}).eq('id',id);
+        if(done.error)throw done.error;
       }
-      await _supabase.from('orders').update({status:'Combined',payment_status:'Merged'}).eq('id',id);
+      const {data:merged,error:readError}=await _supabase.from('order_items').select('price,quantity').eq('order_id',target);
+      if(readError)throw readError;
+      const subtotal=(merged||[]).reduce((a,i)=>a+Number(i.price||0)*Number(i.quantity||0),0);
+      const total=roundToNearest5Sen(roundMoney(subtotal+roundMoney(subtotal*0.06)));
+      const upd=await _supabase.from('orders').update({total_amount:total,status:'accepted',payment_status:'Pending'}).eq('id',target);
+      if(upd.error)throw upd.error;
+      closeCombineSplitModal();
+      await loadPendingOrders();
+      await window.openPosSystemModalWithOrder(target,total);
+      window.openPosPaymentInterface();
+    }catch(e){
+      console.error('Combine orders failed:',e);
+      alert('Combine could not be completed: '+(e?.message||e)+'. Any source marked “Combining” was held safely to prevent duplicate copying; please contact support before retrying that order.');
+    }finally{
+      combineOrdersRunning=false;
+      if(actionButton){actionButton.disabled=false;actionButton.textContent='COMBINE SELECTED ORDERS';}
     }
-    const {data:merged}=await _supabase.from('order_items').select('price,quantity').eq('order_id',target);
-    const subtotal=(merged||[]).reduce((a,i)=>a+Number(i.price||0)*Number(i.quantity||0),0);
-    const total=roundToNearest5Sen(roundMoney(subtotal+roundMoney(subtotal*0.06)));
-    await _supabase.from('orders').update({total_amount:total,status:'accepted',payment_status:'Pending'}).eq('id',target);
-    closeCombineSplitModal();
-    await loadPendingOrders();
-    await window.openPosSystemModalWithOrder(target,total);
-    window.openPosPaymentInterface();
   };
 
   // ---------- REMOVE SUCCESS ALERTS FOR NORMAL ORDER SEND/HOLD/PAY ----------
@@ -4947,35 +4979,47 @@ window.openCloseReportPrintWindow = function(type,date,shiftNo,snapshot,user){
     }
   };
 
+  const addRequestInProgress=new Set();
   window.acceptAddItemRequest=async function(requestId){
-    const {data:req,error}=await _supabase.from('order_item_add_requests').select('*').eq('id',requestId).maybeSingle();
-    if(error||!req){alert('Request not found.');return;}
-    let items=req.items; if(typeof items==='string'){try{items=JSON.parse(items)}catch(e){items=[]}}
-    items=Array.isArray(items)?items:[];
-    if(!items.length){alert('No requested items found.');return;}
-    const rows=items.map(i=>({
-      order_id:req.order_id, menu_item_id:i.menu_item_id, quantity:Number(i.quantity||1),
-      price:Number(i.price||0), modifiers:i.modifiers||[]
-    }));
-    let ins=await _supabase.from('order_items').insert(rows);
-    if(ins.error){
-      const fallback=rows.map(({modifiers,...r},idx)=>({...r,modifier_notes:(items[idx].modifierNote||'')}));
-      ins=await _supabase.from('order_items').insert(fallback);
-    }
-    if(ins.error){alert('Could not add requested items: '+ins.error.message);return;}
+    const key=String(requestId);
+    if(addRequestInProgress.has(key))return;
+    addRequestInProgress.add(key);
+    try{
+      // Claim a still-pending request using the existing accepted status. This prevents double taps and two staff devices
+      // from inserting the same requested items.
+      const claim=await _supabase.from('order_item_add_requests').update({status:'accepted'})
+        .eq('id',requestId).eq('status','pending').select('*').maybeSingle();
+      if(claim.error)throw claim.error;
+      const req=claim.data;
+      if(!req){alert('This request has already been processed or is being handled by another staff member.');return;}
+      let items=req.items; if(typeof items==='string'){try{items=JSON.parse(items)}catch(e){items=[]}}
+      items=Array.isArray(items)?items:[];
+      if(!items.length){await _supabase.from('order_item_add_requests').update({status:'pending'}).eq('id',requestId).eq('status','accepted');alert('No requested items found.');return;}
+      const rows=items.map(i=>({order_id:req.order_id,menu_item_id:i.menu_item_id,quantity:Number(i.quantity||1),price:Number(i.price||0),modifiers:i.modifiers||[],item_note:i.modifierNote||i.item_note||null,added_by_name:'Customer',added_at:new Date().toISOString()}));
+      let ins=await _supabase.from('order_items').insert(rows);
+      if(ins.error){
+        const fallback=rows.map(({modifiers,item_note,...r},idx)=>({...r,modifier_notes:[...(Array.isArray(items[idx].modifiers)?items[idx].modifiers.map(x=>typeof x==='string'?x:(x?.text||'')):[]),items[idx].modifierNote||items[idx].item_note||''].filter(Boolean).join(', ')||null}));
+        ins=await _supabase.from('order_items').insert(fallback);
+      }
+      if(ins.error){await _supabase.from('order_item_add_requests').update({status:'pending'}).eq('id',requestId).eq('status','accepted');throw ins.error;}
 
-    const all=await _supabase.from('order_items').select('price,quantity,is_cancelled').eq('order_id',req.order_id);
-    const subtotal=(all.data||[]).filter(i=>!i.is_cancelled).reduce((s,i)=>s+Number(i.price||0)*Number(i.quantity||0),0);
-    const sst=Math.round(subtotal*.06*100)/100,total=Math.round((subtotal+sst)*100)/100;
-    await _supabase.from('orders').update({subtotal,sst_tax:sst,total_amount:total,status:'accepted'}).eq('id',req.order_id);
+      const all=await _supabase.from('order_items').select('price,quantity,is_cancelled').eq('order_id',req.order_id);
+      if(all.error)throw all.error;
+      const subtotal=(all.data||[]).filter(i=>!i.is_cancelled).reduce((s,i)=>s+Number(i.price||0)*Number(i.quantity||0),0);
+      const sst=Math.round(subtotal*.06*100)/100,total=Math.round((subtotal+sst)*100)/100;
+      const orderUpdate=await _supabase.from('orders').update({subtotal,sst_tax:sst,total_amount:total,status:'accepted'}).eq('id',req.order_id);
+      if(orderUpdate.error)throw orderUpdate.error;
 
-    const s=staffAudit(),now=new Date().toISOString();
-    await _supabase.from('order_item_add_requests').update({
-      status:'accepted',accepted_by_id:s.id,accepted_by_name:s.name,accepted_by_email:s.email,
-      accepted_by_role:s.role,accepted_at:now
-    }).eq('id',requestId);
-    alert(`New items accepted and added to Order #${req.order_id}.`);
-    await fetchIncomingOrders(false); await loadPendingOrders();
+      const staff=staffAudit(),now=new Date().toISOString();
+      const finish=await _supabase.from('order_item_add_requests').update({
+        status:'accepted',accepted_by_id:staff.id,accepted_by_name:staff.name,accepted_by_email:staff.email,
+        accepted_by_role:staff.role,accepted_at:now
+      }).eq('id',requestId).eq('status','accepted');
+      if(finish.error)throw finish.error;
+      alert(`New items accepted and added to Order #${req.order_id}.`);
+      await fetchIncomingOrders(false); await loadPendingOrders();
+    }catch(e){console.error('Add More approval failed:',e);alert('Could not safely complete this request: '+(e?.message||e)+'. Please check the request before retrying.');}
+    finally{addRequestInProgress.delete(key);}
   };
 
   window.declineAddItemRequest=async function(requestId,reason){
@@ -5052,58 +5096,8 @@ window.openCloseReportPrintWindow = function(type,date,shiftNo,snapshot,user){
      in order_items.item_note when that column exists, with safe fallback. */
   const oldAccept=window.acceptAddItemRequest;
   window.acceptAddItemRequest=async function(requestId){
-    const {data:req,error}=await _supabase.from('order_item_add_requests').select('*').eq('id',requestId).maybeSingle();
-    if(error||!req){alert('Request not found.');return;}
-    let items=req.items;
-    if(typeof items==='string'){try{items=JSON.parse(items)}catch(e){items=[]}}
-    items=Array.isArray(items)?items:[];
-    if(!items.length){alert('No requested items found.');return;}
-
-    const orderForActor=await _supabase.from('orders').select('customer_name,customer_id').eq('id',req.order_id).maybeSingle();
-    const customerActor=orderForActor.data?.customer_name||'Customer';
-    const rows=items.map(i=>({
-      order_id:req.order_id,
-      menu_item_id:i.menu_item_id,
-      quantity:Number(i.quantity||1),
-      price:Number(i.price||0),
-      modifiers:i.modifiers||[],
-      item_note:i.modifierNote||i.item_note||null,
-      added_by_name:customerActor,
-      added_at:new Date().toISOString()
-    }));
-    let ins=await _supabase.from('order_items').insert(rows);
-    if(ins.error){
-      const fallback=rows.map(({modifiers,item_note,...r},idx)=>({
-        ...r,
-        modifier_notes:[
-          ...(Array.isArray(items[idx].modifiers)?items[idx].modifiers.map(x=>typeof x==='string'?x:(x?.text||'')).filter(Boolean):[]),
-          items[idx].modifierNote||items[idx].item_note||''
-        ].filter(Boolean).join(', ')||null
-      }));
-      ins=await _supabase.from('order_items').insert(fallback);
-    }
-    if(ins.error){alert('Could not add requested items: '+ins.error.message);return;}
-
-    let all=await _supabase.from('order_items').select('*').eq('order_id',req.order_id);
-    const subtotal=(all.data||[]).filter(i=>!i.is_cancelled).reduce((s,i)=>s+Number(i.price||0)*Number(i.quantity||0),0);
-    const sst=Math.round(subtotal*.06*100)/100,total=Math.round((subtotal+sst)*100)/100;
-    await _supabase.from('orders').update({subtotal,sst_tax:sst,total_amount:total,status:'accepted'}).eq('id',req.order_id);
-
-    let session={};try{
-      session=JSON.parse(localStorage.getItem('cashier_session')||localStorage.getItem('waiter_session')||'{}')||{};
-    }catch(e){}
-    const now=new Date().toISOString();
-    await _supabase.from('order_item_add_requests').update({
-      status:'accepted',
-      accepted_by_id:session.id??null,
-      accepted_by_name:session.full_name||session.name||session.email||'Staff',
-      accepted_by_email:session.email||null,
-      accepted_by_role:session.role||'Staff',
-      accepted_at:now
-    }).eq('id',requestId);
-    alert(`New items accepted and added to Order #${req.order_id}.`);
-    if(typeof fetchIncomingOrders==='function')await fetchIncomingOrders(false);
-    if(typeof loadPendingOrders==='function')await loadPendingOrders();
+    // Delegate to the guarded, idempotent handler above; do not run a second insert path.
+    return oldAccept.apply(this,arguments);
   };
 
   window.getReadableItemNote = readableItemNote;

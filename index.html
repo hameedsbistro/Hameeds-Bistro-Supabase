@@ -3879,12 +3879,37 @@ main{background:transparent!important;}
                 payment_status: 'unpaid'
             };
 
-            const { data: orderData, error } = await _supabase.from('orders').insert([orderPayload]).select().single();
+            // Reuse an unfinished order only when table + normalized phone + customer name
+            // + order type all match. Different customers at the same table stay separate.
+            let orderData = null;
+            let reusedActiveOrder = false;
+            if (currentOrderType === 'dine_in') {
+                const activeLookup = await _supabase.from('orders').select('*')
+                    .eq('table_id', tableId).eq('customer_phone', phone)
+                    .eq('customer_name', name).eq('order_type', currentOrderType)
+                    .in('status', ['pending','accepted','Pending','Accepted'])
+                    .order('created_at', {ascending:false}).limit(1).maybeSingle();
+                if (activeLookup.error) {
+                    console.error('Active customer order lookup failed:', activeLookup.error);
+                    alert('Could not verify your existing table order. Please try again.');
+                    if(placeOrderBtn){placeOrderBtn.dataset.submitting='0';placeOrderBtn.disabled=false;placeOrderBtn.classList.remove('opacity-60','cursor-not-allowed');}
+                    return;
+                }
+                if (activeLookup.data) {
+                    orderData = activeLookup.data;
+                    reusedActiveOrder = true;
+                }
+            }
 
-            if(error) { 
-                console.error('Supabase Error Details:', error);
-                alert('Order failed! Error: ' + error.message); 
-                return; 
+            if (!orderData) {
+                const created = await _supabase.from('orders').insert([orderPayload]).select().single();
+                orderData = created.data;
+                if(created.error || !orderData) {
+                    console.error('Supabase Error Details:', created.error);
+                    alert('Order failed! Error: ' + (created.error?.message || 'Unknown error'));
+                    if(placeOrderBtn){placeOrderBtn.dataset.submitting='0';placeOrderBtn.disabled=false;placeOrderBtn.classList.remove('opacity-60','cursor-not-allowed');}
+                    return;
+                }
             }
 
             const orderItems = cart.map(i => ({
@@ -3920,14 +3945,27 @@ main{background:transparent!important;}
             if(itemsError) {
                 console.error('Order Items Insert Error:', itemsError);
                 alert('Order items could not be saved. Please try again.');
+                if(placeOrderBtn){placeOrderBtn.dataset.submitting='0';placeOrderBtn.disabled=false;placeOrderBtn.classList.remove('opacity-60','cursor-not-allowed');}
                 return;
             }
 
-            alert('Order placed successfully! Pending Cashier verification.');
+            if (reusedActiveOrder) {
+                const allRows = await _supabase.from('order_items').select('price,quantity,is_cancelled').eq('order_id', orderData.id);
+                if (!allRows.error) {
+                    const liveRows=(allRows.data||[]).filter(r=>!r.is_cancelled);
+                    const updatedSubtotal=liveRows.reduce((sum,r)=>sum+Number(r.price||0)*Number(r.quantity||0),0);
+                    const updatedTax=Math.round(updatedSubtotal*.06*100)/100;
+                    const updatedTotal=Math.round((updatedSubtotal+updatedTax)*100)/100;
+                    const totalUpdate=await _supabase.from('orders').update({subtotal:updatedSubtotal,sst_tax:updatedTax,total_amount:updatedTotal}).eq('id',orderData.id);
+                    if(totalUpdate.error)console.warn('Existing order total refresh failed:',totalUpdate.error);
+                }
+            }
+            alert(reusedActiveOrder ? `Items added to your existing Order #${orderData.id}.` : 'Order placed successfully! Pending Cashier verification.');
             cart = [];
             saveCart();
             updateCartBar();
             closeCheckoutModal();
+            if(placeOrderBtn){placeOrderBtn.dataset.submitting='0';placeOrderBtn.disabled=false;placeOrderBtn.classList.remove('opacity-60','cursor-not-allowed');}
             showHome();
         }
 
@@ -4040,6 +4078,10 @@ main{background:transparent!important;}
   const originalSubmitOrder=window.submitOrder;
   window.submitOrder=async function(){
     if(!appendToExistingOrderId) return originalSubmitOrder.apply(this,arguments);
+    const submitBtn=document.querySelector('#checkoutModal button[onclick="submitOrder()"]');
+    if(submitBtn?.dataset.addRequestSubmitting==='1')return;
+    if(submitBtn){submitBtn.dataset.addRequestSubmitting='1';submitBtn.disabled=true;}
+    try{
     if(!cart.length){alert('Please add at least one new item.');return;}
 
     const targetId=Number(appendToExistingOrderId);
@@ -4075,6 +4117,9 @@ main{background:transparent!important;}
     cart=[];saveCart();updateCartBar();closeCheckoutModal();resetAppendOrderMode();
     alert(`New items sent for approval for Order #${targetId}. They will be added only after Cashier/Waiter accepts them.`);
     await showOrderHistory();
+    } finally {
+      if(submitBtn){submitBtn.dataset.addRequestSubmitting='0';submitBtn.disabled=false;}
+    }
   };
 
   const oldBundle=window.getCustomerOrderBundle;
